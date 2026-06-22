@@ -1,0 +1,12 @@
+name: llm-images-eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pillow
+  - pycocotools
+  - pyyaml
+  - tqdm
+  - pip:
+      - openai>=1.55.0
