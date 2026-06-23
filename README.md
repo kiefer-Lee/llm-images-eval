@@ -20,6 +20,8 @@ VLM API 往往会在服务端再次缩放图片，而且数据集中每张图片
 - `--coord-mode normalized`：模型返回相对于发送图片的 `[0, 1]` 归一化框，再由脚本映射回原图像素坐标。
 - `--coord-mode original`：模型直接返回原始数据集图片坐标系下的像素框，脚本只做裁剪和合法性检查，不再缩放。
 
+如果大模型返回的 JSON 无法解析，或 `bbox_2d` 超出了 prompt 约定的坐标范围，脚本会自动重试同一张图片。默认重试 2 次，可用 `--format-retries` 调整。
+
 ## 安装
 
 Windows 上 `pycocotools` 用 Conda 安装通常更省心，推荐使用 Conda 环境：
@@ -49,28 +51,47 @@ $env:VLM_MODEL="qwen2.5-vl-72b-instruct"
 
 ## 运行检测
 
-下面是使用本地 VisDrone COCO 标注文件的示例：
+默认只检测 `Datasets/VisDrone` 下的验证集：
 
 ```powershell
-python -m llm_images_eval.predict `
-  --ann-file D:\PythonProjects\SOD\Datasets\VisDrone\annotations\val.json `
-  --image-root D:\PythonProjects\SOD\Datasets\VisDrone\VisDrone2019-DET-val\VisDrone2019-DET-val\images `
-  --output-dir D:\PythonProjects\SOD\llm-images-eval\outputs\visdrone_val `
-  --max-images 20
+python -m src.predict `
+  --max-images 20 `
+  --save-vis
 ```
 
-完整验证集推理时，去掉 `--max-images` 即可。脚本会输出：
+如果完整推理时只想随机保存一部分框注图：
+
+```powershell
+python -m src.predict `
+  --save-vis `
+  --vis-random-count 50 `
+  --vis-random-seed 42
+```
+
+脚本会自动定位：
+
+- `Datasets/VisDrone/annotations/val.json`
+- `Datasets/VisDrone/VisDrone2019-DET-val/VisDrone2019-DET-val/images`
+
+完整验证集推理时，去掉 `--max-images` 即可。默认输出到 `outputs/visdrone_val`，脚本会输出：
 
 - `detections.coco.json`：用于评估的 COCO detection 结果列表。
 - `raw_responses.jsonl`：每张图的大模型原始回复、prompt 元信息、解析后的检测结果。
 - `failures.jsonl`：请求失败或响应解析失败的图片记录。
+- `prompt_violation_stats.json`：统计大模型回答不符合 prompt 要求的次数和比例。
+- `visualizations/`：加 `--save-vis` 后保存框注可视化结果图；可用 `--vis-random-count` 控制随机保存数量。
+
+推理过程中会显示 tqdm 进度条，并实时展示累计检测框数量、失败图片数量、已保存可视化图片数量。需要减少日志时可加 `--quiet`。
+
+`prompt_violation_stats.json` 包含两个主要比例：
+
+- `violation_attempt_ratio`：不符合 prompt 的回答次数 / 大模型回答总次数。
+- `violation_image_ratio`：至少发生过一次不合规回答的图片数 / 处理图片总数。
 
 ## 评估
 
 ```powershell
-python -m llm_images_eval.eval_coco `
-  --ann-file D:\PythonProjects\SOD\Datasets\VisDrone\annotations\val.json `
-  --pred-file D:\PythonProjects\SOD\llm-images-eval\outputs\visdrone_val\detections.coco.json
+python -m src.eval_coco
 ```
 
 评估脚本底层使用 `pycocotools.COCOeval`，思路上和 MMDetection 常用的 COCO 评估路径一致。

@@ -11,6 +11,7 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
 from .coco_io import write_json
+from .visdrone_paths import resolve_visdrone_val_paths, validate_visdrone_val_paths
 
 
 METRIC_NAMES = [
@@ -31,9 +32,12 @@ METRIC_NAMES = [
 
 def main() -> None:
     args = parse_args()
+    visdrone_paths = resolve_visdrone_val_paths(args.visdrone_root)
+    validate_visdrone_val_paths(visdrone_paths)
+    pred_file = args.pred_file or _default_pred_file()
     metrics = evaluate_coco(
-        ann_file=args.ann_file,
-        pred_file=args.pred_file,
+        ann_file=visdrone_paths.ann_file,
+        pred_file=pred_file,
         iou_type=args.iou_type,
         max_dets=args.max_dets,
         output=args.output,
@@ -42,13 +46,28 @@ def main() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="COCO-style detection evaluation.")
-    parser.add_argument("--ann-file", required=True, help="Ground-truth COCO annotation JSON.")
-    parser.add_argument("--pred-file", required=True, help="COCO detection result JSON list.")
+    parser = argparse.ArgumentParser(description="COCO-style detection evaluation on VisDrone val.")
+    parser.add_argument(
+        "--visdrone-root",
+        default=None,
+        help=(
+            "Path to Datasets/VisDrone. Defaults to project-local Datasets/VisDrone, "
+            "falling back to ../Datasets/VisDrone."
+        ),
+    )
+    parser.add_argument(
+        "--pred-file",
+        default=None,
+        help="COCO detection result JSON list. Defaults to outputs/visdrone_val/detections.coco.json.",
+    )
     parser.add_argument("--iou-type", default="bbox", choices=["bbox", "segm"])
     parser.add_argument("--max-dets", default="1,10,100", help="Comma-separated maxDets.")
     parser.add_argument("--output", default=None, help="Optional metrics JSON output path.")
     return parser.parse_args()
+
+
+def _default_pred_file() -> Path:
+    return Path(__file__).resolve().parents[1] / "outputs" / "visdrone_val" / "detections.coco.json"
 
 
 def evaluate_coco(
