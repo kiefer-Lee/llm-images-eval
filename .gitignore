@@ -1,4 +1,6 @@
 outputs/
+.idea/
+.DS_Store
 *.log
 __pycache__/
 .pytest_cache/
