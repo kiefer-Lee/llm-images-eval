@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,15 @@ def run_prediction(args: argparse.Namespace) -> None:
     images = dataset.images[args.start_index :]
     if args.max_images is not None:
         images = images[: args.max_images]
+
+    resume_state = _load_append_log_resume_state(raw_path, pred_path) if args.append_logs else None
+    existing_detection_count = len(resume_state.detections) if resume_state else 0
+    skipped_image_count = 0
+    if resume_state:
+        original_image_count = len(images)
+        images = [image for image in images if image.id not in resume_state.completed_image_ids]
+        skipped_image_count = original_image_count - len(images)
+
     vis_image_ids = _select_visualization_image_ids(
         image_ids=[image.id for image in images],
         save_vis=args.save_vis,
@@ -148,6 +158,12 @@ def run_prediction(args: argparse.Namespace) -> None:
         tqdm.write(f"Annotations: {visdrone_paths.ann_file}")
         tqdm.write(f"Image root: {visdrone_paths.image_root}")
         tqdm.write(f"Output dir: {output_dir}")
+        if resume_state:
+            tqdm.write(
+                "Resume: "
+                f"{existing_detection_count} existing detection(s), "
+                f"{skipped_image_count} completed image(s) skipped"
+            )
         if args.save_vis:
             tqdm.write(
                 f"Visualizations: {len(vis_image_ids)} image(s) -> {vis_dir} "
@@ -168,7 +184,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         )
         client = OpenAICompatibleVlmClient(config)
 
-    coco_detections: list[dict[str, Any]] = []
+    coco_detections: list[dict[str, Any]] = list(resume_state.detections) if resume_state else []
     num_failures = 0
     num_visualized = 0
     num_prompt_violation_images = 0
@@ -294,6 +310,8 @@ def run_prediction(args: argparse.Namespace) -> None:
             "image_root": str(visdrone_paths.image_root),
             "num_images": len(images),
             "num_detections": len(coco_detections),
+            "num_existing_detections": existing_detection_count,
+            "num_resume_skipped_images": skipped_image_count,
             "coord_mode": args.coord_mode,
             "image_max_side": None if args.no_resize else args.image_max_side,
             "letterbox": args.letterbox,
@@ -324,6 +342,82 @@ def run_prediction(args: argparse.Namespace) -> None:
             f"{prompt_violation_stats['violation_image_ratio']:.2%} by image "
             f"-> {output_dir / 'prompt_violation_stats.json'}"
         )
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    detections: list[dict[str, Any]]
+    completed_image_ids: set[int]
+
+
+def _load_append_log_resume_state(raw_path: Path, pred_path: Path) -> ResumeState:
+    raw_detections_by_image = _load_detections_from_raw_log(raw_path)
+    pred_detections_by_image = _load_detections_from_prediction_file(pred_path)
+
+    detections: list[dict[str, Any]] = []
+    for image_detections in raw_detections_by_image.values():
+        detections.extend(image_detections)
+    for image_id, image_detections in pred_detections_by_image.items():
+        if image_id not in raw_detections_by_image:
+            detections.extend(image_detections)
+
+    return ResumeState(
+        detections=detections,
+        completed_image_ids=set(raw_detections_by_image) | set(pred_detections_by_image),
+    )
+
+
+def _load_detections_from_raw_log(path: Path) -> dict[int, list[dict[str, Any]]]:
+    detections_by_image: dict[int, list[dict[str, Any]]] = {}
+    if not path.exists():
+        return detections_by_image
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            image_id = _coerce_int(payload.get("image_id"))
+            image_detections = payload.get("coco_detections")
+            if image_id is None or not isinstance(image_detections, list):
+                continue
+            detections_by_image[image_id] = [
+                det for det in image_detections if isinstance(det, dict)
+            ]
+    return detections_by_image
+
+
+def _load_detections_from_prediction_file(path: Path) -> dict[int, list[dict[str, Any]]]:
+    detections_by_image: dict[int, list[dict[str, Any]]] = {}
+    if not path.exists():
+        return detections_by_image
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, list):
+        raise ValueError(f"Existing prediction file must be a JSON list: {path}")
+
+    for det in payload:
+        if not isinstance(det, dict):
+            continue
+        image_id = _coerce_int(det.get("image_id"))
+        if image_id is None:
+            continue
+        detections_by_image.setdefault(image_id, []).append(det)
+    return detections_by_image
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _default_output_dir() -> Path:

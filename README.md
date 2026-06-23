@@ -83,6 +83,8 @@ python -m src.predict `
 
 推理过程中会显示 tqdm 进度条，并实时展示累计检测框数量、失败图片数量、已保存可视化图片数量。需要减少日志时可加 `--quiet`。
 
+续跑时加 `--append-logs`。脚本会保留并追加 JSONL 日志，同时从已有 `raw_responses.jsonl` 和 `detections.coco.json` 恢复检测结果，跳过已经成功完成的图片，最后重新写出合并后的 `detections.coco.json`。
+
 `prompt_violation_stats.json` 包含两个主要比例：
 
 - `violation_attempt_ratio`：不符合 prompt 的回答次数 / 大模型回答总次数。
@@ -106,6 +108,8 @@ python -m llm_images_eval.tools.visdrone_to_coco `
   --ann-dir D:\PythonProjects\SOD\Datasets\VisDrone\VisDrone2019-DET-val\VisDrone2019-DET-val\annotations `
   --out D:\PythonProjects\SOD\Datasets\VisDrone\annotations\val_from_txt.json
 ```
+
+如需保留 VisDrone 原始 category 0 ignored regions，可加 `--include-ignored`。转换器会把这些无类别忽略区域展开为每个 VisDrone 有效类别下的 `iscrowd=1` / `ignore=1` 标注，使 `pycocotools.COCOeval` 能按 crowd ignore 逻辑处理它们。
 
 ## Prompt 输出约定
 

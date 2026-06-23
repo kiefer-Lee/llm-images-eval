@@ -49,6 +49,7 @@ def convert_visdrone_to_coco(
 ) -> None:
     image_dir = Path(image_dir)
     ann_dir = Path(ann_dir)
+    valid_category_ids = {cat["id"] for cat in VISDRONE_CATEGORIES}
 
     images: list[dict[str, Any]] = []
     annotations: list[dict[str, Any]] = []
@@ -82,28 +83,36 @@ def convert_visdrone_to_coco(
                     continue
                 x, y, w, h, score, category_id, truncation, occlusion = fields[:8]
                 category_id = int(category_id)
-                if category_id == 0 and not include_ignored:
+                is_ignored = category_id == 0 or float(score) == 0.0
+                if category_id == 0:
+                    if not include_ignored:
+                        continue
+                    target_category_ids = sorted(valid_category_ids)
+                elif category_id in valid_category_ids:
+                    target_category_ids = [category_id]
+                else:
                     continue
-                if category_id not in {cat["id"] for cat in VISDRONE_CATEGORIES}:
-                    continue
+
                 w = max(0.0, min(w, width - x))
                 h = max(0.0, min(h, height - y))
                 if w <= 0 or h <= 0:
                     continue
-                annotations.append(
-                    {
-                        "id": ann_id,
-                        "image_id": image_id,
-                        "category_id": category_id,
-                        "bbox": [x, y, w, h],
-                        "area": w * h,
-                        "iscrowd": 0,
-                        "ignore": int(score == 0),
-                        "truncation": int(truncation),
-                        "occlusion": int(occlusion),
-                    }
-                )
-                ann_id += 1
+                for target_category_id in target_category_ids:
+                    annotations.append(
+                        {
+                            "id": ann_id,
+                            "image_id": image_id,
+                            "category_id": target_category_id,
+                            "bbox": [x, y, w, h],
+                            "area": w * h,
+                            "iscrowd": int(is_ignored),
+                            "ignore": int(is_ignored),
+                            "visdrone_category_id": category_id,
+                            "truncation": int(truncation),
+                            "occlusion": int(occlusion),
+                        }
+                    )
+                    ann_id += 1
 
     write_json(
         out,
