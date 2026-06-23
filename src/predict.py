@@ -11,7 +11,14 @@ from typing import Any
 from tqdm import tqdm
 
 from .coco_io import CocoDataset, append_jsonl, write_json
-from .image_ops import prepare_image, sent_xyxy_to_original_xyxy, xyxy_to_coco_xywh
+from .image_ops import (
+    COORD_TRUST_TOL,
+    frame_bounds,
+    infer_coord_mode,
+    prepare_image,
+    sent_xyxy_to_original_xyxy,
+    xyxy_to_coco_xywh,
+)
 from .parsing import ParsedDetection, parse_model_json
 from .prompts import build_detection_prompt
 from .visualize import save_detection_visualization, visualization_path
@@ -54,6 +61,17 @@ def parse_args() -> argparse.Namespace:
         choices=["sent", "normalized", "original"],
         default="sent",
         help="Coordinate frame expected from the model.",
+    )
+    parser.add_argument(
+        "--coord-tolerance",
+        type=float,
+        default=COORD_TRUST_TOL,
+        help=(
+            "Relative slack when matching model coordinates to a frame. Boxes "
+            "within this margin of the requested frame are trusted (and clamped); "
+            "clearly out-of-frame boxes are auto-detected as another frame, and "
+            "only coordinates that fit no frame trigger a format retry."
+        ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
@@ -190,6 +208,7 @@ def run_prediction(args: argparse.Namespace) -> None:
     num_prompt_violation_images = 0
     num_prompt_violation_attempts = 0
     num_model_response_attempts = 0
+    num_frame_mismatch_images = 0
     progress = tqdm(images, desc="VLM detect", unit="img")
     for idx, image in enumerate(progress, start=1):
         progress.set_description(f"VLM detect {idx}/{len(images)}")
@@ -203,13 +222,14 @@ def run_prediction(args: argparse.Namespace) -> None:
                 max_side=None if args.no_resize else args.image_max_side,
                 letterbox=args.letterbox,
             )
-            parsed, parsed_payload, response_text, final_prompt, retry_errors, response_attempts = request_valid_response(
+            parsed, parsed_payload, response_text, final_prompt, retry_errors, response_attempts, effective_coord_mode = request_valid_response(
                 client=client,
                 dataset=dataset,
                 image=image,
                 prepared_transform=prepared.transform,
                 image_data_url=prepared.data_url,
                 coord_mode=args.coord_mode,
+                coord_tolerance=args.coord_tolerance,
                 extra_instruction=args.extra_instruction,
                 format_retries=args.format_retries,
                 mock_empty=args.mock_empty,
@@ -218,12 +238,15 @@ def run_prediction(args: argparse.Namespace) -> None:
             num_prompt_violation_attempts += len(retry_errors)
             if retry_errors:
                 num_prompt_violation_images += 1
+            frame_mismatch = effective_coord_mode != args.coord_mode
+            if frame_mismatch:
+                num_frame_mismatch_images += 1
             image_detections = convert_to_coco_detections(
                 parsed=parsed,
                 dataset=dataset,
                 image_id=image.id,
                 transform=prepared.transform,
-                coord_mode=args.coord_mode,
+                coord_mode=effective_coord_mode,
                 min_score=args.min_score,
             )
             coco_detections.extend(image_detections)
@@ -250,6 +273,9 @@ def run_prediction(args: argparse.Namespace) -> None:
                     "response_attempts": response_attempts,
                     "prompt_violation": bool(retry_errors),
                     "format_retry_errors": retry_errors,
+                    "requested_coord_mode": args.coord_mode,
+                    "effective_coord_mode": effective_coord_mode,
+                    "frame_mismatch": frame_mismatch,
                     "parsed_payload": parsed_payload,
                     "coco_detections": image_detections,
                     "visualization_path": str(vis_path) if vis_path else None,
@@ -288,6 +314,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             fail=num_failures,
             vis=num_visualized,
             viol=num_prompt_violation_attempts,
+            frame=num_frame_mismatch_images,
             refresh=True,
         )
     progress.close()
@@ -297,6 +324,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         num_model_response_attempts=num_model_response_attempts,
         num_prompt_violation_attempts=num_prompt_violation_attempts,
         num_prompt_violation_images=num_prompt_violation_images,
+        num_frame_mismatch_images=num_frame_mismatch_images,
         num_failures=num_failures,
     )
     write_json(pred_path, coco_detections)
@@ -313,6 +341,8 @@ def run_prediction(args: argparse.Namespace) -> None:
             "num_existing_detections": existing_detection_count,
             "num_resume_skipped_images": skipped_image_count,
             "coord_mode": args.coord_mode,
+            "coord_tolerance": args.coord_tolerance,
+            "num_frame_mismatch_images": num_frame_mismatch_images,
             "image_max_side": None if args.no_resize else args.image_max_side,
             "letterbox": args.letterbox,
             "mock_empty": args.mock_empty,
@@ -341,6 +371,11 @@ def run_prediction(args: argparse.Namespace) -> None:
             f"{prompt_violation_stats['violation_attempt_ratio']:.2%} by response attempt, "
             f"{prompt_violation_stats['violation_image_ratio']:.2%} by image "
             f"-> {output_dir / 'prompt_violation_stats.json'}"
+        )
+        tqdm.write(
+            "Frame mismatches (model ignored requested coord frame, auto-corrected): "
+            f"{prompt_violation_stats['frame_mismatch_image_ratio']:.2%} by image "
+            f"({num_frame_mismatch_images}/{len(images)})"
         )
 
 
@@ -449,12 +484,15 @@ def request_valid_response(
     prepared_transform: Any,
     image_data_url: str,
     coord_mode: str,
+    coord_tolerance: float,
     extra_instruction: str | None,
     format_retries: int,
     mock_empty: bool,
-) -> tuple[list[ParsedDetection], Any, str, str, list[str], int]:
+) -> tuple[list[ParsedDetection], Any, str, str, list[str], int, str]:
     if format_retries < 0:
         raise ValueError("--format-retries must be >= 0.")
+    if coord_tolerance < 0:
+        raise ValueError("--coord-tolerance must be >= 0.")
 
     retry_errors: list[str] = []
     response_text = ""
@@ -462,6 +500,7 @@ def request_valid_response(
     parsed_payload: Any = None
     parsed: list[ParsedDetection] = []
     response_attempts = 0
+    effective_coord_mode = coord_mode
     for attempt in range(format_retries + 1):
         retry_instruction = _build_retry_instruction(retry_errors[-1]) if retry_errors else None
         merged_extra = _merge_extra_instruction(extra_instruction, retry_instruction)
@@ -476,8 +515,24 @@ def request_valid_response(
         response_attempts += 1
         try:
             parsed, parsed_payload = parse_model_json(response_text)
-            validate_model_detections(parsed, dataset, prepared_transform, coord_mode)
-            return parsed, parsed_payload, response_text, final_prompt, retry_errors, response_attempts
+            effective_coord_mode = infer_coord_mode(
+                [det.bbox_2d for det in parsed],
+                prepared_transform,
+                coord_mode,
+                trust_tol=coord_tolerance,
+            )
+            validate_model_detections(
+                parsed, dataset, prepared_transform, effective_coord_mode, coord_tolerance
+            )
+            return (
+                parsed,
+                parsed_payload,
+                response_text,
+                final_prompt,
+                retry_errors,
+                response_attempts,
+                effective_coord_mode,
+            )
         except Exception as exc:  # noqa: BLE001 - validation errors should trigger semantic retry.
             retry_errors.append(str(exc))
             if attempt >= format_retries:
@@ -488,7 +543,15 @@ def request_valid_response(
                     response_text=response_text,
                     prompt=final_prompt,
                 ) from exc
-    return parsed, parsed_payload, response_text, final_prompt, retry_errors, response_attempts
+    return (
+        parsed,
+        parsed_payload,
+        response_text,
+        final_prompt,
+        retry_errors,
+        response_attempts,
+        effective_coord_mode,
+    )
 
 
 class PromptValidationError(ValueError):
@@ -512,6 +575,7 @@ def _build_prompt_violation_stats(
     num_model_response_attempts: int,
     num_prompt_violation_attempts: int,
     num_prompt_violation_images: int,
+    num_frame_mismatch_images: int,
     num_failures: int,
 ) -> dict[str, float | int]:
     return {
@@ -519,6 +583,7 @@ def _build_prompt_violation_stats(
         "num_model_response_attempts": num_model_response_attempts,
         "num_prompt_violation_attempts": num_prompt_violation_attempts,
         "num_prompt_violation_images": num_prompt_violation_images,
+        "num_frame_mismatch_images": num_frame_mismatch_images,
         "num_failures": num_failures,
         "violation_attempt_ratio": _safe_ratio(
             num_prompt_violation_attempts,
@@ -526,6 +591,10 @@ def _build_prompt_violation_stats(
         ),
         "violation_image_ratio": _safe_ratio(
             num_prompt_violation_images,
+            num_images,
+        ),
+        "frame_mismatch_image_ratio": _safe_ratio(
+            num_frame_mismatch_images,
             num_images,
         ),
     }
@@ -540,6 +609,7 @@ def validate_model_detections(
     dataset: CocoDataset,
     transform: Any,
     coord_mode: str,
+    coord_tolerance: float,
 ) -> None:
     for idx, det in enumerate(parsed):
         resolved_category_id = dataset.resolve_category_id(det.label, det.category_id)
@@ -559,7 +629,7 @@ def validate_model_detections(
             x1, x2 = x2, x1
         if y2 < y1:
             y1, y2 = y2, y1
-        _validate_bbox_range(idx, [x1, y1, x2, y2], transform, coord_mode)
+        _validate_bbox_range(idx, [x1, y1, x2, y2], transform, coord_mode, coord_tolerance)
 
 
 def _validate_bbox_range(
@@ -567,28 +637,35 @@ def _validate_bbox_range(
     bbox: list[float],
     transform: Any,
     coord_mode: str,
+    coord_tolerance: float,
 ) -> None:
     x1, y1, x2, y2 = bbox
-    if coord_mode == "sent":
-        max_x = float(transform.sent_width)
-        max_y = float(transform.sent_height)
-        mode_desc = f"sent image pixels [0,{transform.sent_width}] x [0,{transform.sent_height}]"
-    elif coord_mode == "normalized":
-        max_x = 1.0
-        max_y = 1.0
-        mode_desc = "normalized coordinates [0,1]"
-    elif coord_mode == "original":
-        max_x = float(transform.original_width)
-        max_y = float(transform.original_height)
-        mode_desc = f"original image pixels [0,{transform.original_width}] x [0,{transform.original_height}]"
-    else:
-        raise ValueError(f"Unsupported coord mode: {coord_mode}")
+    max_x, max_y = frame_bounds(transform, coord_mode)
+    mode_desc = {
+        "sent": f"sent image pixels [0,{transform.sent_width}] x [0,{transform.sent_height}]",
+        "original": f"original image pixels [0,{transform.original_width}] x [0,{transform.original_height}]",
+        "normalized": "normalized coordinates [0,1]",
+        "normalized_1000": "normalized coordinates [0,1000]",
+    }.get(coord_mode, coord_mode)
 
+    # Coordinates within tolerance of the frame are accepted; reprojection
+    # clamps the residual overflow (objects partly outside the image are
+    # legitimately clipped). Only coordinates that fit no frame land here, so a
+    # gross mismatch -- a wrong scale we could not auto-detect -- still retries.
+    margin_x = max_x * coord_tolerance
+    margin_y = max_y * coord_tolerance
     values = [x1, y1, x2, y2]
-    if any(v < 0 for v in values) or x1 > max_x or x2 > max_x or y1 > max_y or y2 > max_y:
+    if (
+        min(values) < -max(margin_x, margin_y)
+        or x1 > max_x + margin_x
+        or x2 > max_x + margin_x
+        or y1 > max_y + margin_y
+        or y2 > max_y + margin_y
+    ):
         raise ValueError(
-            f"detections[{idx}].bbox_2d={bbox} is outside {mode_desc}. "
-            "This violates the coordinate frame requested in the prompt."
+            f"detections[{idx}].bbox_2d={bbox} does not fit any coordinate frame "
+            f"(closest match {mode_desc}, tolerance {coord_tolerance:.0%}). "
+            "The model ignored the requested coordinate frame."
         )
 
 
