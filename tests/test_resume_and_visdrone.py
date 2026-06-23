@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 
 import pytest
 from PIL import Image
 
+import src.predict as predict_module
 from src.image_ops import (
     ImageTransform,
     infer_coord_mode,
     sent_xyxy_to_original_xyxy,
 )
-from src.predict import _load_append_log_resume_state, _validate_bbox_range
+from src.predict import _load_append_log_resume_state, _validate_bbox_range, run_prediction
 from src.tools.visdrone_to_coco import VISDRONE_CATEGORIES, convert_visdrone_to_coco
 
 
@@ -170,3 +172,165 @@ def test_validate_bbox_range_rejects_gross_out_of_frame_box():
     transform = _downscale_transform()
     with pytest.raises(ValueError):
         _validate_bbox_range(0, [0.0, 0.0, 2000.0, 900.0], transform, "sent", 0.15)
+
+
+def test_predict_resume_skips_completed_images_and_preserves_existing_detections(tmp_path):
+    visdrone_root = tmp_path / "VisDrone"
+    ann_root = visdrone_root / "annotations"
+    image_root = visdrone_root / "VisDrone2019-DET-val" / "VisDrone2019-DET-val" / "images"
+    output_dir = tmp_path / "outputs"
+    ann_root.mkdir(parents=True)
+    image_root.mkdir(parents=True)
+    output_dir.mkdir()
+
+    Image.new("RGB", (32, 24), color="white").save(image_root / "000001.jpg")
+    Image.new("RGB", (32, 24), color="white").save(image_root / "000002.jpg")
+    (ann_root / "val.json").write_text(
+        json.dumps(
+            {
+                "info": {},
+                "licenses": [],
+                "images": [
+                    {"id": 1, "file_name": "000001.jpg", "width": 32, "height": 24},
+                    {"id": 2, "file_name": "000002.jpg", "width": 32, "height": 24},
+                ],
+                "annotations": [],
+                "categories": VISDRONE_CATEGORIES,
+            }
+        ),
+        encoding="utf-8",
+    )
+    existing_detection = {
+        "image_id": 1,
+        "category_id": 4,
+        "bbox": [1.0, 2.0, 3.0, 4.0],
+        "score": 0.9,
+    }
+    (output_dir / "raw_responses.jsonl").write_text(
+        json.dumps({"image_id": 1, "coco_detections": [existing_detection]}) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "detections.coco.json").write_text(
+        json.dumps([existing_detection]),
+        encoding="utf-8",
+    )
+
+    run_prediction(
+        Namespace(
+            visdrone_root=str(visdrone_root),
+            output_dir=str(output_dir),
+            model=None,
+            api_key=None,
+            base_url=None,
+            max_images=2,
+            start_index=0,
+            image_max_side=1280,
+            no_resize=True,
+            letterbox=False,
+            coord_mode="sent",
+            coord_tolerance=0.15,
+            temperature=0.0,
+            max_tokens=None,
+            json_mode="none",
+            retries=0,
+            retry_sleep=0.0,
+            format_retries=0,
+            sleep=0.0,
+            min_score=0.0,
+            extra_instruction=None,
+            save_vis=False,
+            vis_dir=None,
+            vis_score_thr=0.0,
+            vis_random_count=None,
+            vis_random_seed=42,
+            append_logs=False,
+            resume=True,
+            mock_empty=True,
+            quiet=True,
+        )
+    )
+
+    detections = json.loads((output_dir / "detections.coco.json").read_text(encoding="utf-8"))
+    raw_lines = (output_dir / "raw_responses.jsonl").read_text(encoding="utf-8").splitlines()
+    run_config = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
+
+    assert detections == [existing_detection]
+    assert [json.loads(line)["image_id"] for line in raw_lines] == [1, 2]
+    assert run_config["resume"] is True
+    assert run_config["resume_enabled"] is True
+    assert run_config["num_resume_skipped_images"] == 1
+
+def test_predict_writes_detection_snapshots_during_run(tmp_path, monkeypatch):
+    visdrone_root = tmp_path / "VisDrone"
+    ann_root = visdrone_root / "annotations"
+    image_root = visdrone_root / "VisDrone2019-DET-val" / "VisDrone2019-DET-val" / "images"
+    output_dir = tmp_path / "outputs"
+    ann_root.mkdir(parents=True)
+    image_root.mkdir(parents=True)
+
+    Image.new("RGB", (32, 24), color="white").save(image_root / "000001.jpg")
+    Image.new("RGB", (32, 24), color="white").save(image_root / "000002.jpg")
+    (ann_root / "val.json").write_text(
+        json.dumps(
+            {
+                "info": {},
+                "licenses": [],
+                "images": [
+                    {"id": 1, "file_name": "000001.jpg", "width": 32, "height": 24},
+                    {"id": 2, "file_name": "000002.jpg", "width": 32, "height": 24},
+                ],
+                "annotations": [],
+                "categories": VISDRONE_CATEGORIES,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    original_write_json = predict_module.write_json
+    prediction_snapshot_writes = 0
+
+    def spy_write_json(path, payload):
+        nonlocal prediction_snapshot_writes
+        if getattr(path, "name", "") == "detections.coco.json":
+            prediction_snapshot_writes += 1
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(predict_module, "write_json", spy_write_json)
+
+    run_prediction(
+        Namespace(
+            visdrone_root=str(visdrone_root),
+            output_dir=str(output_dir),
+            model=None,
+            api_key=None,
+            base_url=None,
+            max_images=2,
+            start_index=0,
+            image_max_side=1280,
+            no_resize=True,
+            letterbox=False,
+            coord_mode="sent",
+            coord_tolerance=0.15,
+            temperature=0.0,
+            max_tokens=None,
+            json_mode="none",
+            retries=0,
+            retry_sleep=0.0,
+            format_retries=0,
+            sleep=0.0,
+            min_score=0.0,
+            extra_instruction=None,
+            save_vis=False,
+            vis_dir=None,
+            vis_score_thr=0.0,
+            vis_random_count=None,
+            vis_random_seed=42,
+            append_logs=False,
+            resume=False,
+            mock_empty=True,
+            quiet=True,
+        )
+    )
+
+    assert prediction_snapshot_writes >= 4
+    assert json.loads((output_dir / "detections.coco.json").read_text(encoding="utf-8")) == []

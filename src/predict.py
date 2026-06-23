@@ -74,12 +74,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=None,
-        help="Cap on response tokens. Omit (default) to send no cap so reasoning models have full budget.",
-    )
+
     parser.add_argument("--json-mode", choices=["none", "json_object"], default="none")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
@@ -129,6 +124,14 @@ def parse_args() -> argparse.Namespace:
         help="Append raw/failure JSONL logs instead of replacing them at run start.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from an existing output directory: keep JSONL logs, restore "
+            "detections, and skip images already present in raw_responses.jsonl."
+        ),
+    )
+    parser.add_argument(
         "--mock-empty",
         action="store_true",
         help="Do not call API; produce empty detections for pipeline testing.",
@@ -151,7 +154,9 @@ def run_prediction(args: argparse.Namespace) -> None:
     failure_path = output_dir / "failures.jsonl"
     pred_path = output_dir / "detections.coco.json"
     vis_dir = Path(args.vis_dir) if args.vis_dir else output_dir / "visualizations"
-    if not args.append_logs:
+    resume_requested = bool(getattr(args, "resume", False))
+    resume_enabled = bool(resume_requested or args.append_logs)
+    if not resume_enabled:
         for log_path in (raw_path, failure_path):
             if log_path.exists():
                 log_path.unlink()
@@ -161,7 +166,7 @@ def run_prediction(args: argparse.Namespace) -> None:
     if args.max_images is not None:
         images = images[: args.max_images]
 
-    resume_state = _load_append_log_resume_state(raw_path, pred_path) if args.append_logs else None
+    resume_state = _load_append_log_resume_state(raw_path, pred_path) if resume_enabled else None
     existing_detection_count = len(resume_state.detections) if resume_state else 0
     skipped_image_count = 0
     if resume_state:
@@ -200,7 +205,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             api_key=args.api_key,
             base_url=args.base_url,
             temperature=args.temperature,
-            max_tokens=args.max_tokens,
             json_mode=args.json_mode,
             retries=args.retries,
             retry_sleep=args.retry_sleep,
@@ -208,6 +212,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         client = OpenAICompatibleVlmClient(config)
 
     coco_detections: list[dict[str, Any]] = list(resume_state.detections) if resume_state else []
+    write_json(pred_path, coco_detections)
     num_failures = 0
     num_visualized = 0
     num_prompt_violation_images = 0
@@ -312,6 +317,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             )
             if not args.quiet:
                 progress.write(f"[WARN] Failed image_id={image.id} file={image.file_name}: {exc!r}")
+        write_json(pred_path, coco_detections)
         if args.sleep > 0:
             time.sleep(args.sleep)
         progress.set_postfix(
@@ -352,6 +358,8 @@ def run_prediction(args: argparse.Namespace) -> None:
             "letterbox": args.letterbox,
             "mock_empty": args.mock_empty,
             "append_logs": args.append_logs,
+            "resume": resume_requested,
+            "resume_enabled": resume_enabled,
             "num_failures": num_failures,
             "format_retries": args.format_retries,
             "prompt_violation_stats": prompt_violation_stats,

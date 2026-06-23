@@ -81,8 +81,11 @@ def normalize_label(label: str) -> str:
 def write_json(path: str | Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    temp_path.replace(path)
 
 
 def append_jsonl(path: str | Path, payload: Any) -> None:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import time
@@ -11,7 +11,6 @@ class VlmConfig:
     api_key: str | None
     base_url: str | None
     temperature: float = 0.0
-    max_tokens: int | None = None
     json_mode: str = "none"
     retries: int = 2
     retry_sleep: float = 2.0
@@ -23,7 +22,6 @@ class VlmConfig:
         api_key: str | None,
         base_url: str | None,
         temperature: float,
-        max_tokens: int | None,
         json_mode: str,
         retries: int,
         retry_sleep: float,
@@ -36,7 +34,6 @@ class VlmConfig:
             api_key=api_key or os.getenv("VLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
             base_url=base_url or os.getenv("VLM_BASE_URL"),
             temperature=temperature,
-            max_tokens=max_tokens,
             json_mode=json_mode,
             retries=retries,
             retry_sleep=retry_sleep,
@@ -71,8 +68,6 @@ class OpenAICompatibleVlmClient:
             "messages": [{"role": "user", "content": content}],
             "temperature": self.config.temperature,
         }
-        if self.config.max_tokens is not None:
-            request["max_tokens"] = self.config.max_tokens
         if self.config.json_mode == "json_object":
             request["response_format"] = {"type": "json_object"}
 
@@ -100,7 +95,7 @@ def _message_to_text(message: object) -> str:
     Prefer ``content`` (the answer channel). Only fall back to
     ``reasoning_content`` when ``content`` is empty, since some reasoning
     models leave ``content`` blank. Note that a truncated reasoning response
-    has no final answer to recover — :func:`_raise_if_truncated` guards that.
+    has no final answer to recover 鈥?:func:`_raise_if_truncated` guards that.
     """
     content = getattr(message, "content", None)
     text = _content_to_text(content) if content is not None else ""
@@ -116,10 +111,9 @@ def _message_to_text(message: object) -> str:
 def _raise_if_truncated(choice: object, text: str) -> None:
     """Fail loudly when the model was cut off before emitting its answer.
 
-    Reasoning models can consume the entire ``max_tokens`` budget while still
-    thinking, returning ``finish_reason="length"`` with only partial reasoning
-    and no JSON answer. Without this guard the downstream parser mines a stray
-    bbox out of the chain-of-thought and silently reports zero detections.
+    Some providers can still stop a response with ``finish_reason="length"``.
+    Without this guard the downstream parser may mine a stray bbox out of a
+    partial response and silently report invalid detections.
     """
     finish_reason = getattr(choice, "finish_reason", None)
     if finish_reason == "length":
@@ -129,8 +123,8 @@ def _raise_if_truncated(choice: object, text: str) -> None:
         if not has_answer:
             raise RuntimeError(
                 "Model response was truncated (finish_reason='length') before "
-                "producing an answer. Increase --max-tokens; reasoning models "
-                "need enough budget to think and then emit the JSON."
+                "producing an answer. Use a service/model configuration that "
+                "allows longer outputs."
             )
 
 

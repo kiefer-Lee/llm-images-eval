@@ -75,7 +75,7 @@ python -m src.predict `
 
 完整验证集推理时，去掉 `--max-images` 即可。默认输出到 `outputs/visdrone_val`，脚本会输出：
 
-- `detections.coco.json`：用于评估的 COCO detection 结果列表。
+- `detections.coco.json`：用于评估的 COCO detection 结果列表。推理开始时会创建快照，并在每张图片处理结束后实时原子更新；进程中断时，已完成图片的检测结果仍会保留。
 - `raw_responses.jsonl`：每张图的大模型原始回复、prompt 元信息、解析后的检测结果。
 - `failures.jsonl`：请求失败或响应解析失败的图片记录。
 - `prompt_violation_stats.json`：统计大模型回答不符合 prompt 要求的次数和比例。
@@ -83,7 +83,7 @@ python -m src.predict `
 
 推理过程中会显示 tqdm 进度条，并实时展示累计检测框数量、失败图片数量、已保存可视化图片数量。需要减少日志时可加 `--quiet`。
 
-续跑时加 `--append-logs`。脚本会保留并追加 JSONL 日志，同时从已有 `raw_responses.jsonl` 和 `detections.coco.json` 恢复检测结果，跳过已经成功完成的图片，最后重新写出合并后的 `detections.coco.json`。
+续跑时加 `--resume`。脚本会保留并追加 JSONL 日志，同时从已有 `raw_responses.jsonl` 和 `detections.coco.json` 恢复检测结果，跳过已经成功完成的图片，最后重新写出合并后的 `detections.coco.json`。旧命令里的 `--append-logs` 也会启用同样的恢复逻辑，以兼容已有脚本。
 
 `prompt_violation_stats.json` 包含两个主要比例：
 
