@@ -67,13 +67,31 @@ def _load_json_object(text: str) -> Any:
 
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
-        return json.loads(fenced.group(1).strip())
+        inner = fenced.group(1).strip()
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            parsed = _decode_first_json(inner)
+            if parsed is not None:
+                return parsed
 
-    start_candidates = [idx for idx in [text.find("{"), text.find("[")] if idx >= 0]
-    if not start_candidates:
-        raise ValueError("No JSON object or array found in model response.")
-    start = min(start_candidates)
-    end = max(text.rfind("}"), text.rfind("]"))
-    if end <= start:
-        raise ValueError("Could not find a complete JSON object or array in response.")
-    return json.loads(text[start : end + 1])
+    # Find the first JSON object/array and decode just it, ignoring any
+    # trailing prose or extra values the model appended (json's "Extra data").
+    parsed = _decode_first_json(text)
+    if parsed is not None:
+        return parsed
+    raise ValueError("No JSON object or array found in model response.")
+
+
+def _decode_first_json(text: str) -> Any | None:
+    """Decode the first complete JSON object/array, ignoring trailing data."""
+    decoder = json.JSONDecoder()
+    for idx in range(len(text)):
+        if text[idx] not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text, idx)
+            return obj
+        except json.JSONDecodeError:
+            continue
+    return None

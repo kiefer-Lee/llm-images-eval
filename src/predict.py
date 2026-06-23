@@ -74,7 +74,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Cap on response tokens. Omit (default) to send no cap so reasoning models have full budget.",
+    )
     parser.add_argument("--json-mode", choices=["none", "json_object"], default="none")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--retry-sleep", type=float, default=2.0)

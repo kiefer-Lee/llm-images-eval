@@ -11,7 +11,7 @@ class VlmConfig:
     api_key: str | None
     base_url: str | None
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int | None = None
     json_mode: str = "none"
     retries: int = 2
     retry_sleep: float = 2.0
@@ -23,7 +23,7 @@ class VlmConfig:
         api_key: str | None,
         base_url: str | None,
         temperature: float,
-        max_tokens: int,
+        max_tokens: int | None,
         json_mode: str,
         retries: int,
         retry_sleep: float,
@@ -70,8 +70,9 @@ class OpenAICompatibleVlmClient:
             "model": self.config.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
         }
+        if self.config.max_tokens is not None:
+            request["max_tokens"] = self.config.max_tokens
         if self.config.json_mode == "json_object":
             request["response_format"] = {"type": "json_object"}
 
@@ -79,8 +80,12 @@ class OpenAICompatibleVlmClient:
         for attempt in range(self.config.retries + 1):
             try:
                 response = self.client.chat.completions.create(**request)
-                message = response.choices[0].message
-                return _content_to_text(message.content)
+                if isinstance(response, str):
+                    return response
+                choice = response.choices[0]
+                text = _message_to_text(choice.message)
+                _raise_if_truncated(choice, text)
+                return text
             except Exception as exc:  # noqa: BLE001 - API clients raise provider-specific exceptions.
                 last_error = exc
                 if attempt >= self.config.retries:
@@ -89,7 +94,50 @@ class OpenAICompatibleVlmClient:
         raise RuntimeError(f"VLM request failed after retries: {last_error}") from last_error
 
 
+def _message_to_text(message: object) -> str:
+    """Extract text from a chat message.
+
+    Prefer ``content`` (the answer channel). Only fall back to
+    ``reasoning_content`` when ``content`` is empty, since some reasoning
+    models leave ``content`` blank. Note that a truncated reasoning response
+    has no final answer to recover — :func:`_raise_if_truncated` guards that.
+    """
+    content = getattr(message, "content", None)
+    text = _content_to_text(content) if content is not None else ""
+    if text.strip():
+        return text
+
+    reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    if reasoning:
+        return _content_to_text(reasoning)
+    return text
+
+
+def _raise_if_truncated(choice: object, text: str) -> None:
+    """Fail loudly when the model was cut off before emitting its answer.
+
+    Reasoning models can consume the entire ``max_tokens`` budget while still
+    thinking, returning ``finish_reason="length"`` with only partial reasoning
+    and no JSON answer. Without this guard the downstream parser mines a stray
+    bbox out of the chain-of-thought and silently reports zero detections.
+    """
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length":
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        has_answer = bool(_content_to_text(content).strip()) if content is not None else False
+        if not has_answer:
+            raise RuntimeError(
+                "Model response was truncated (finish_reason='length') before "
+                "producing an answer. Increase --max-tokens; reasoning models "
+                "need enough budget to think and then emit the JSON."
+            )
+
+
+
 def _content_to_text(content: object) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
